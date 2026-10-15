@@ -2217,6 +2217,10 @@ void HandleClient(HANDLE hPipe) {
 			std::wstring reply = L"SETMODE " + SetModesFromPipe(buffer + 7);
 			DWORD bytesWritten;
 			WriteFile(hPipe, reply.c_str(), static_cast<DWORD>((reply.length() + 1) * sizeof(wchar_t)), &bytesWritten, NULL);
+			// DisconnectNamedPipe at the end of HandleClient discards whatever
+			// the client has not read yet, so without this the reply never
+			// arrives. Returns at once if the client has gone.
+			FlushFileBuffers(hPipe);
 			vddlog("c", WStringToString(reply).c_str());
 		}
 		else if (wcsncmp(buffer, L"SETGPU", 6) == 0) {
