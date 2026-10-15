@@ -54,6 +54,13 @@ bool g_Running = true;
 mutex g_Mutex;
 HANDLE g_pipeHandle = INVALID_HANDLE_VALUE;
 
+// lithiumbridge: every monitor this driver has created and not yet torn down,
+// so SETMODE can report a new mode list to Windows without a driver reload.
+// Kept by IddCxMonitorCreate and the monitor's cleanup callback.
+std::mutex g_MonitorsMutex;
+std::vector<IDDCX_MONITOR> g_Monitors;
+static std::wstring SetModesFromPipe(const wchar_t* args);
+
 using namespace std;
 using namespace Microsoft::IndirectDisp;
 using namespace Microsoft::WRL;
@@ -2202,6 +2209,12 @@ void HandleClient(HANDLE hPipe) {
 			logAvailableGPUs();
 			vddlog("c", "Logged all GPUs");
 		}  
+		else if (wcsncmp(buffer, L"SETMODE", 7) == 0) {
+			std::wstring reply = SetModesFromPipe(buffer + 7);
+			vddlog("c", WStringToString(reply).c_str());
+			DWORD bytesWritten;
+			WriteFile(hPipe, reply.c_str(), static_cast<DWORD>((reply.length() + 1) * sizeof(wchar_t)), &bytesWritten, NULL);
+		}
 		else if (wcsncmp(buffer, L"SETGPU", 6) == 0) {
 			std::wstring gpuName = buffer + 7;
 			gpuName = gpuName.substr(1, gpuName.size() - 2); 
@@ -2276,8 +2289,10 @@ DWORD WINAPI NamedPipeServer(LPVOID lpParam) {
 	SECURITY_ATTRIBUTES sa;
 	sa.nLength = sizeof(SECURITY_ATTRIBUTES);
 	sa.bInheritHandle = FALSE;
-	const wchar_t* sddl = L"D:(A;;GA;;;WD)";
-	vddlog("d", "Starting pipe with parameters: D:(A;;GA;;;WD)");
+	// lithiumbridge: SYSTEM and Administrators only. Upstream grants Everyone
+	// full access, which lets any local user reload the driver or change it.
+	const wchar_t* sddl = L"D:(A;;GA;;;SY)(A;;GA;;;BA)";
+	vddlog("d", "Starting pipe with parameters: D:(A;;GA;;;SY)(A;;GA;;;BA)");
 	if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
 		sddl, SDDL_REVISION_1, &sa.lpSecurityDescriptor, NULL)) {
 		DWORD ErrorCode = GetLastError();
@@ -3796,6 +3811,12 @@ void IndirectDeviceContext::CreateMonitor(unsigned int index) {
 
 	WDF_OBJECT_ATTRIBUTES Attr;
 	WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&Attr, IndirectDeviceContextWrapper);
+	// lithiumbridge: forget the monitor when WDF tears it down, so SETMODE
+	// never reports modes to a destroyed monitor.
+	Attr.EvtCleanupCallback = [](WDFOBJECT Object) {
+		std::lock_guard<std::mutex> lock(g_MonitorsMutex);
+		g_Monitors.erase(std::remove(g_Monitors.begin(), g_Monitors.end(), static_cast<IDDCX_MONITOR>(Object)), g_Monitors.end());
+	};
 
 	IDDCX_MONITOR_INFO MonitorInfo = {};
 	MonitorInfo.Size = sizeof(MonitorInfo);
@@ -3846,6 +3867,10 @@ void IndirectDeviceContext::CreateMonitor(unsigned int index) {
 	{
 		vddlog("d", "Monitor created successfully.");
 		m_Monitor = MonitorCreateOut.MonitorObject;
+		{
+			std::lock_guard<std::mutex> lock(g_MonitorsMutex);
+			g_Monitors.push_back(m_Monitor);
+		}
 
 		// Associate the monitor with this device context
 		auto* pContext = WdfObjectGet_IndirectDeviceContextWrapper(MonitorCreateOut.MonitorObject);
@@ -4168,6 +4193,72 @@ void CreateTargetMode2(IDDCX_TARGET_MODE2& Mode, UINT Width, UINT Height, UINT V
 }
 
 _Use_decl_annotations_
+// lithiumbridge: SETMODE <w> <h> [<w> <h> ...], each at 60 Hz, at most 16.
+// Replaces the mode list and reports it to Windows for every monitor that is
+// online, so the display changes size without a driver reload. A reload, or
+// any new monitor, makes Windows re-apply its stored topology and switch the
+// physical displays back on.
+static std::wstring SetModesFromPipe(const wchar_t* args)
+{
+	int vsyncNum = 60, vsyncDen = 1;
+	float_to_vsync(60.0f, vsyncNum, vsyncDen);
+
+	vector<tuple<int, int, int, int>> modes;
+	const wchar_t* p = args;
+	while (modes.size() < 16) {
+		int w = 0, h = 0, used = 0;
+		if (swscanf_s(p, L" %d %d%n", &w, &h, &used) != 2) {
+			break;
+		}
+		if (w < 640 || h < 480 || w > 16384 || h > 16384) {
+			return L"ERR size out of range";
+		}
+		modes.push_back(make_tuple(w, h, vsyncNum, vsyncDen));
+		p += used;
+	}
+	if (modes.empty()) {
+		return L"ERR usage: SETMODE <w> <h> [<w> <h> ...]";
+	}
+
+	monitorModes = modes;
+	RebuildKnownMonitorModesCache();
+
+	// The same test DriverEntry uses to pick the "2" callbacks: a driver on
+	// that path must report modes with IddCxMonitorUpdateModes2.
+	const bool v2 = IDD_IS_FIELD_AVAILABLE(IDD_CX_CLIENT_CONFIG, EvtIddCxAdapterQueryTargetInfo);
+
+	std::lock_guard<std::mutex> lock(g_MonitorsMutex);
+	std::wstringstream out;
+	out << L"OK modes=" << modes.size() << L" monitors=" << g_Monitors.size() << (v2 ? L" api=2" : L" api=1");
+	for (IDDCX_MONITOR monitor : g_Monitors) {
+		NTSTATUS status;
+		if (v2) {
+			vector<IDDCX_TARGET_MODE2> targetModes(modes.size());
+			for (size_t i = 0; i < modes.size(); i++) {
+				CreateTargetMode2(targetModes[i], get<0>(modes[i]), get<1>(modes[i]), get<2>(modes[i]), get<3>(modes[i]));
+			}
+			IDARG_IN_UPDATEMODES2 in = {};
+			in.Reason = IDDCX_UPDATE_REASON_OTHER;
+			in.TargetModeCount = static_cast<UINT>(targetModes.size());
+			in.pTargetModes = targetModes.data();
+			status = IddCxMonitorUpdateModes2(monitor, &in);
+		}
+		else {
+			vector<IDDCX_TARGET_MODE> targetModes(modes.size());
+			for (size_t i = 0; i < modes.size(); i++) {
+				CreateTargetMode(targetModes[i], get<0>(modes[i]), get<1>(modes[i]), get<2>(modes[i]), get<3>(modes[i]));
+			}
+			IDARG_IN_UPDATEMODES in = {};
+			in.Reason = IDDCX_UPDATE_REASON_OTHER;
+			in.TargetModeCount = static_cast<UINT>(targetModes.size());
+			in.pTargetModes = targetModes.data();
+			status = IddCxMonitorUpdateModes(monitor, &in);
+		}
+		out << L" status=0x" << std::hex << static_cast<unsigned long>(status) << std::dec;
+	}
+	return out.str();
+}
+
 NTSTATUS VirtualDisplayDriverMonitorQueryModes(IDDCX_MONITOR MonitorObject, const IDARG_IN_QUERYTARGETMODES* pInArgs, IDARG_OUT_QUERYTARGETMODES* pOutArgs)////////////////////////////////////////////////////////////////////////////////
 {
 	UNREFERENCED_PARAMETER(MonitorObject);
