@@ -2210,10 +2210,14 @@ void HandleClient(HANDLE hPipe) {
 			vddlog("c", "Logged all GPUs");
 		}  
 		else if (wcsncmp(buffer, L"SETMODE", 7) == 0) {
-			std::wstring reply = SetModesFromPipe(buffer + 7);
-			vddlog("c", WStringToString(reply).c_str());
+			// The reply is one UTF-16 message starting "SETMODE " ("SETMODE OK
+			// ..." or "SETMODE ERR ..."). With SendLogsThroughPipe on, the
+			// driver's log lines (UTF-8) reach the client on the same pipe
+			// first, so a client reads messages until it finds this prefix.
+			std::wstring reply = L"SETMODE " + SetModesFromPipe(buffer + 7);
 			DWORD bytesWritten;
 			WriteFile(hPipe, reply.c_str(), static_cast<DWORD>((reply.length() + 1) * sizeof(wchar_t)), &bytesWritten, NULL);
+			vddlog("c", WStringToString(reply).c_str());
 		}
 		else if (wcsncmp(buffer, L"SETGPU", 6) == 0) {
 			std::wstring gpuName = buffer + 7;
