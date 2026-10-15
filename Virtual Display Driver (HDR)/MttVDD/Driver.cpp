@@ -2289,10 +2289,13 @@ DWORD WINAPI NamedPipeServer(LPVOID lpParam) {
 	SECURITY_ATTRIBUTES sa;
 	sa.nLength = sizeof(SECURITY_ATTRIBUTES);
 	sa.bInheritHandle = FALSE;
-	// lithiumbridge: SYSTEM and Administrators only. Upstream grants Everyone
-	// full access, which lets any local user reload the driver or change it.
-	const wchar_t* sddl = L"D:(A;;GA;;;SY)(A;;GA;;;BA)";
-	vddlog("d", "Starting pipe with parameters: D:(A;;GA;;;SY)(A;;GA;;;BA)");
+	// lithiumbridge: SYSTEM, Administrators and LOCAL SERVICE only. Upstream
+	// grants Everyone full access, which lets any local user reload the driver
+	// or change it. LOCAL SERVICE is this driver's own UMDF host:
+	// StopNamedPipeServer opens the pipe to release the server thread, and
+	// without it every unload waits about 60 s for UMDF to give up.
+	const wchar_t* sddl = L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LS)";
+	vddlog("d", "Starting pipe with parameters: D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LS)");
 	if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
 		sddl, SDDL_REVISION_1, &sa.lpSecurityDescriptor, NULL)) {
 		DWORD ErrorCode = GetLastError();
@@ -4198,6 +4201,12 @@ _Use_decl_annotations_
 // online, so the display changes size without a driver reload. A reload, or
 // any new monitor, makes Windows re-apply its stored topology and switch the
 // physical displays back on.
+//
+// The caller must keep the display's current size in the list: a list that
+// drops it takes the display offline. Windows also offers a new size only
+// once mode pruning is off for the monitor (ChangeDisplaySettingsEx with
+// CDS_ENABLE_UNSAFE_MODES), because the monitor's own modes are fixed when it
+// arrives. Measured on Windows Server 2025, 2026-10-15.
 static std::wstring SetModesFromPipe(const wchar_t* args)
 {
 	int vsyncNum = 60, vsyncDen = 1;
