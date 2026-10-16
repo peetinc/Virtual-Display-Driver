@@ -71,6 +71,7 @@ extern "C" DRIVER_INITIALIZE DriverEntry;
 
 EVT_WDF_DRIVER_DEVICE_ADD VirtualDisplayDriverDeviceAdd;
 EVT_WDF_DEVICE_D0_ENTRY VirtualDisplayDriverDeviceD0Entry;
+EVT_WDF_DEVICE_D0_EXIT VirtualDisplayDriverDeviceD0Exit;
 
 EVT_IDD_CX_ADAPTER_INIT_FINISHED VirtualDisplayDriverAdapterInitFinished;
 EVT_IDD_CX_ADAPTER_COMMIT_MODES VirtualDisplayDriverAdapterCommitModes;
@@ -2850,6 +2851,7 @@ NTSTATUS VirtualDisplayDriverDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT pDevice
 	// Register for power callbacks - in this sample only power-on is needed
 	WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&PnpPowerCallbacks);
 	PnpPowerCallbacks.EvtDeviceD0Entry = VirtualDisplayDriverDeviceD0Entry;
+	PnpPowerCallbacks.EvtDeviceD0Exit = VirtualDisplayDriverDeviceD0Exit;
 	WdfDeviceInitSetPnpPowerEventCallbacks(pDeviceInit, &PnpPowerCallbacks);
 
 	IDD_CX_CLIENT_CONFIG IddConfig;
@@ -3017,6 +3019,36 @@ NTSTATUS VirtualDisplayDriverDeviceD0Entry(WDFDEVICE Device, WDF_POWER_DEVICE_ST
 	return STATUS_SUCCESS;
 }
 
+// The device is leaving D0 (disable, stop, sleep). Stop every swap-chain
+// thread now: left running, a disable waited a minute and then Windows killed
+// the host (ac-win-micro 2026-10-15, DriverFrameworks-UserMode 10120/10111).
+_Use_decl_annotations_
+NTSTATUS VirtualDisplayDriverDeviceD0Exit(WDFDEVICE Device, WDF_POWER_DEVICE_STATE TargetState)
+{
+	stringstream logStream;
+	logStream << "Leaving D0, target state " << TargetState << ": stopping swap-chain processing.";
+	vddlog("i", logStream.str().c_str());
+	auto* pContext = WdfObjectGet_IndirectDeviceContextWrapper(Device);
+	if (pContext && pContext->pContext)
+	{
+		pContext->pContext->StopAllProcessing();
+	}
+	return STATUS_SUCCESS;
+}
+
+void IndirectDeviceContext::StopAllProcessing()
+{
+	std::map<IDDCX_MONITOR, std::unique_ptr<SwapChainProcessor>> stopping;
+	{
+		std::lock_guard<std::mutex> lock(m_ProcessingThreadsMutex);
+		stopping.swap(m_ProcessingThreads);
+	}
+	stringstream logStream;
+	logStream << "Stopping " << stopping.size() << " swap-chain processing thread(s).";
+	vddlog("i", logStream.str().c_str());
+	stopping.clear(); // each destructor signals its thread and joins it, bounded
+}
+
 #pragma region Direct3DDevice
 
 Direct3DDevice::Direct3DDevice(LUID AdapterLuid) : AdapterLuid(AdapterLuid)
@@ -3176,7 +3208,7 @@ SwapChainProcessor::~SwapChainProcessor()
 	if (m_hThread.Get())
 	{
 		// Wait for the thread to terminate
-		DWORD waitResult = WaitForSingleObject(m_hThread.Get(), INFINITE);
+		DWORD waitResult = WaitForSingleObject(m_hThread.Get(), 5000);
 		switch (waitResult)
 		{
 		case WAIT_OBJECT_0:
@@ -3191,7 +3223,7 @@ SwapChainProcessor::~SwapChainProcessor()
 			break;
 		case WAIT_TIMEOUT:
 			logStream.str(""); 
-			logStream << "Thread wait timed out. This should not happen. GetLastError: " << GetLastError();
+			logStream << "Swap-chain thread did not stop within 5 s; continuing without it.";
 			vddlog("e", logStream.str().c_str());
 			break;
 		default:

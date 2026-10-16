@@ -117,6 +117,7 @@ namespace Microsoft
 
             void AssignSwapChain(IDDCX_MONITOR Monitor, IDDCX_SWAPCHAIN SwapChain, LUID RenderAdapter, HANDLE NewFrameEvent);
             void UnassignSwapChain(IDDCX_MONITOR Monitor);
+            void StopAllProcessing();
 
         protected:
 
