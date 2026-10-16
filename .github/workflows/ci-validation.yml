@@ -93,31 +93,18 @@ jobs:
           $sln = "${{ env.VDD_SOLUTION }}"
           if (-not (Test-Path $sln)) { throw "VDD solution file not found at: $sln" }
 
-          # Pick an available UMDF WDF header version on the runner.
-          # Kits can be laid out either versioned:
-          #   Include\<sdk>\wdf\umdf\2.xx
-          # or unversioned:
-          #   Include\wdf\umdf\2.xx
+          # Build against the UMDF version the project pins (2.25), never the
+          # newest headers on the runner: those can be a pre-release WDK, and
+          # newer Windows refuses to load a driver built with one (event 10117,
+          # "compiled using a pre-release version of the WDK"; 26H2 build
+          # 26300 rejected a 2.35 build that 25H2 still loaded).
+          $umdfPinned = "2.25"
           $umdfRoots = @(
             (Join-Path $env:WINDOWS_SDK_DIR ("Include\" + $env:WINDOWS_TARGET_PLATFORM_VERSION + "\wdf\umdf")),
             (Join-Path $env:WINDOWS_SDK_DIR "Include\wdf\umdf")
-          ) | Where-Object { Test-Path $_ }
-
-          if (-not $umdfRoots -or $umdfRoots.Count -eq 0) {
-            throw "UMDF WDF include root not found under $env:WINDOWS_SDK_DIR (tried versioned + unversioned layouts)"
-          }
-
-          $umdfBest =
-            $umdfRoots |
-            ForEach-Object { Get-ChildItem -Path $_ -Directory -ErrorAction SilentlyContinue } |
-            Where-Object { $_.Name -match '^\d+\.\d+$' } |
-            Sort-Object -Property Name -Descending |
-            Select-Object -First 1
-
-          if (-not $umdfBest) { throw "No UMDF version directories found under: $($umdfRoots -join ', ')" }
-
-          $umdfMinor = ($umdfBest.Name -split '\.')[1]
-          Write-Output "Using UMDF version: $($umdfBest.Name) (minor=$umdfMinor) from $($umdfBest.FullName)"
+          ) | Where-Object { Test-Path (Join-Path $_ $umdfPinned) }
+          if (-not $umdfRoots) { throw "UMDF $umdfPinned headers not found under $env:WINDOWS_SDK_DIR" }
+          Write-Output "Using UMDF version: $umdfPinned (project pin) from $(Join-Path @($umdfRoots)[0] $umdfPinned)"
 
           msbuild $sln `
             /m `
@@ -126,7 +113,6 @@ jobs:
             /p:Platform="${{ matrix.platform }}" `
             /p:WindowsSdkDir="$env:WINDOWS_SDK_DIR" `
             /p:WindowsTargetPlatformVersion="$env:WINDOWS_TARGET_PLATFORM_VERSION" `
-            /p:UMDF_VERSION_MINOR="$umdfMinor" `
             /p:EnableInfVerif=false `
             /p:RunApiValidator=false `
             /verbosity:minimal
