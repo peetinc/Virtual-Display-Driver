@@ -72,6 +72,7 @@ extern "C" DRIVER_INITIALIZE DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD VirtualDisplayDriverDeviceAdd;
 EVT_WDF_DEVICE_D0_ENTRY VirtualDisplayDriverDeviceD0Entry;
 EVT_WDF_DEVICE_D0_EXIT VirtualDisplayDriverDeviceD0Exit;
+static void RetireProcessor(std::unique_ptr<SwapChainProcessor> p);
 
 EVT_IDD_CX_ADAPTER_INIT_FINISHED VirtualDisplayDriverAdapterInitFinished;
 EVT_IDD_CX_ADAPTER_COMMIT_MODES VirtualDisplayDriverAdapterCommitModes;
@@ -3046,7 +3047,11 @@ void IndirectDeviceContext::StopAllProcessing()
 	stringstream logStream;
 	logStream << "Stopping " << stopping.size() << " swap-chain processing thread(s).";
 	vddlog("i", logStream.str().c_str());
-	stopping.clear(); // each destructor signals its thread and joins it, bounded
+	for (auto& entry : stopping)
+	{
+		RetireProcessor(std::move(entry.second)); // bounded join; leaks rather than frees a thread that will not stop
+	}
+	stopping.clear();
 }
 
 #pragma region Direct3DDevice
@@ -3182,6 +3187,24 @@ SwapChainProcessor::SwapChainProcessor(IDDCX_SWAPCHAIN hSwapChain, shared_ptr<Di
 	}
 }
 
+bool SwapChainProcessor::Stop(DWORD ms)
+{
+	SetEvent(m_hTerminateEvent.Get());
+	return !m_hThread.Get() || WaitForSingleObject(m_hThread.Get(), ms) == WAIT_OBJECT_0;
+}
+
+// The one place a processor is destroyed. A thread that will not stop is leaked
+// with its processor, never freed under it.
+static void RetireProcessor(std::unique_ptr<SwapChainProcessor> p)
+{
+	if (p && !p->Stop(5000))
+	{
+		p->m_Abandoned = true;
+		vddlog("e", "Swap-chain thread did not stop within 5 s; leaking its processor so it never touches freed memory.");
+		(void)p.release();
+	}
+}
+
 SwapChainProcessor::~SwapChainProcessor()
 {
 	stringstream logStream;
@@ -3289,7 +3312,12 @@ void SwapChainProcessor::Run()
 	WdfObjectDelete((WDFOBJECT)m_hSwapChain);
 	m_hSwapChain = nullptr;   added error handling in so its not called to delete swap chain if its not needed.
 	*/
-	if (m_hSwapChain)
+	if (m_Abandoned.load())
+	{
+		// Retired after a failed bounded stop: the owner has moved on, so do not touch IddCx objects.
+		vddlog("w", "Processor was abandoned; skipping swap-chain deletion.");
+	}
+	else if (m_hSwapChain)
 	{
 		WdfObjectDelete((WDFOBJECT)m_hSwapChain);
 		logStream.str("");
@@ -3737,6 +3765,11 @@ IndirectDeviceContext::~IndirectDeviceContext()
 	logStream.str("");
 	logStream << "Released " << processingThreads.size() << " monitor processing thread(s).";
 	vddlog("d", logStream.str().c_str());
+	for (auto& entry : processingThreads)
+	{
+		RetireProcessor(std::move(entry.second));
+	}
+	processingThreads.clear();
 }
 
 #define NUM_VIRTUAL_DISPLAYS 1   //What is this even used for ?? Its never referenced
@@ -3970,6 +4003,7 @@ void IndirectDeviceContext::AssignSwapChain(IDDCX_MONITOR Monitor, IDDCX_SWAPCHA
 
 		if (previousProcessor) {
 			vddlog("d", "Replaced existing processing thread for this monitor only.");
+			RetireProcessor(std::move(previousProcessor));
 		}
 		else {
 			vddlog("d", "Created a new processing thread for this monitor.");
@@ -4043,6 +4077,7 @@ void IndirectDeviceContext::UnassignSwapChain(IDDCX_MONITOR Monitor)
 	if (processorToStop)
 	{
 		vddlog("i", "Unassigning swapchain for one monitor. Its processing thread will be stopped.");
+		RetireProcessor(std::move(processorToStop));
 	}
 	else
 	{

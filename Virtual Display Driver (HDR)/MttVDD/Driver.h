@@ -12,6 +12,7 @@
 #include <avrt.h>
 #include <wrl.h>
 
+#include <atomic>
 #include <memory>
 #include <vector>
 #include <map>
@@ -73,6 +74,7 @@ namespace Microsoft
         public:
             SwapChainProcessor(IDDCX_SWAPCHAIN hSwapChain, std::shared_ptr<Direct3DDevice> Device, HANDLE NewFrameEvent);
             ~SwapChainProcessor();
+            bool Stop(DWORD ms);
 
         private:
             static DWORD CALLBACK RunThread(LPVOID Argument);
@@ -86,6 +88,7 @@ namespace Microsoft
             HANDLE m_hAvailableBufferEvent;
             Microsoft::WRL::Wrappers::Thread m_hThread;
             Microsoft::WRL::Wrappers::Event m_hTerminateEvent;
+            std::atomic<bool> m_Abandoned{false};
         };
 
         /// <summary>
